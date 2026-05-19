@@ -1,14 +1,12 @@
-type InitOptions = {
+type WidgetConfig = {
   /** Project slug, must match an entry in heatmap-data/projects.json */
   project: string;
-  /** Full URL of the deployed heatmap-proxy, e.g. https://heatmap-proxy-two.vercel.app */
+  /** Full URL of the deployed heatmap-proxy */
   endpoint: string;
-  /** Flush interval in ms. Default 30000 (30s). */
+  /** Flush interval in ms. Default 30000. */
   flushIntervalMs?: number;
   /** Max events buffered before forced flush. Default 100. */
   maxBatchSize?: number;
-  /** Skip the first-time name modal — use when host app already has user context. */
-  identifyAs?: string;
 };
 
 type Event = {
@@ -20,19 +18,29 @@ type Event = {
   ts: number;
 };
 
-const LS_USER_ID = 'heatmap_user_id';
-const LS_USER_NAME = 'heatmap_user_name';
 const LS_OPTOUT = 'heatmap_optout';
+const SS_ACTIVE = 'heatmap_active';
+const SS_USER_ID = 'heatmap_session_user_id';
+const SS_USER_NAME = 'heatmap_session_user_name';
+const SS_SESSION_ID = 'heatmap_session_id';
 
-let state: {
-  options: Required<Omit<InitOptions, 'identifyAs'>>;
+type RuntimeState = {
+  config: Required<WidgetConfig>;
+  tracking: boolean;
   userId: string | null;
-  sessionId: string;
+  userName: string | null;
+  sessionId: string | null;
   buffer: Event[];
   batchNumber: number;
   flushTimer: number | null;
-  started: boolean;
-} | null = null;
+  widgetRoot: HTMLElement | null;
+  pillEl: HTMLElement | null;
+  recordingEl: HTMLElement | null;
+};
+
+let state: RuntimeState | null = null;
+let clickListenerAttached = false;
+let visibilityListenerAttached = false;
 
 function uuid(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -51,33 +59,31 @@ function isOptedOut(): boolean {
   }
 }
 
-function getStoredUserId(): string | null {
+function ssGet(k: string): string | null {
   try {
-    return localStorage.getItem(LS_USER_ID);
+    return sessionStorage.getItem(k);
   } catch {
     return null;
   }
 }
 
-async function registerUser(name: string): Promise<string> {
-  if (!state) throw new Error('Tracker not initialized');
-  const res = await fetch(`${state.options.endpoint}/api/v1/users`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
-  });
-  if (!res.ok) throw new Error(`User registration failed: ${res.status}`);
-  const data = (await res.json()) as { userId: string; name: string };
+function ssSet(k: string, v: string): void {
   try {
-    localStorage.setItem(LS_USER_ID, data.userId);
-    localStorage.setItem(LS_USER_NAME, data.name);
+    sessionStorage.setItem(k, v);
   } catch {
-    /* ignore localStorage failures */
+    /* ignore */
   }
-  return data.userId;
 }
 
-function showFirstTimeModal(): Promise<string | null> {
+function ssDel(k: string): void {
+  try {
+    sessionStorage.removeItem(k);
+  } catch {
+    /* ignore */
+  }
+}
+
+function showNameModal(): Promise<string | null> {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.setAttribute('data-heatmap-modal', '');
@@ -96,9 +102,9 @@ function showFirstTimeModal(): Promise<string | null> {
     `;
 
     card.innerHTML = `
-      <h2 style="margin:0 0 8px;font-size:18px;font-weight:600;">First time here</h2>
+      <h2 style="margin:0 0 8px;font-size:18px;font-weight:600;">Start heatmap session</h2>
       <p style="margin:0 0 20px;color:#aaa;font-size:14px;line-height:1.5;">
-        We track clicks anonymously to improve this product. Enter your name so we can label your session.
+        Enter your name to label this session. Clicks will be recorded until you tap End.
       </p>
       <input
         data-heatmap-name
@@ -106,18 +112,17 @@ function showFirstTimeModal(): Promise<string | null> {
         placeholder="Your name"
         style="width:100%;padding:10px 12px;background:#0a0a0a;border:1px solid #333;
                border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;outline:none;"
-        autofocus
       />
       <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
-        <button data-heatmap-skip
+        <button data-heatmap-cancel
           style="padding:8px 14px;background:transparent;border:1px solid #333;
                  border-radius:6px;color:#aaa;cursor:pointer;font-size:13px;">
-          Don't track me
+          Cancel
         </button>
         <button data-heatmap-submit
           style="padding:8px 14px;background:#fff;border:1px solid #fff;
                  border-radius:6px;color:#000;cursor:pointer;font-size:13px;font-weight:500;">
-          Start
+          Start recording
         </button>
       </div>
     `;
@@ -127,7 +132,7 @@ function showFirstTimeModal(): Promise<string | null> {
 
     const input = card.querySelector<HTMLInputElement>('[data-heatmap-name]')!;
     const submitBtn = card.querySelector<HTMLButtonElement>('[data-heatmap-submit]')!;
-    const skipBtn = card.querySelector<HTMLButtonElement>('[data-heatmap-skip]')!;
+    const cancelBtn = card.querySelector<HTMLButtonElement>('[data-heatmap-cancel]')!;
 
     setTimeout(() => input.focus(), 50);
 
@@ -147,62 +152,116 @@ function showFirstTimeModal(): Promise<string | null> {
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') submit();
     });
-    skipBtn.addEventListener('click', () => {
-      try {
-        localStorage.setItem(LS_OPTOUT, 'true');
-      } catch {
-        /* ignore */
-      }
+    cancelBtn.addEventListener('click', () => {
       cleanup();
       resolve(null);
     });
   });
 }
 
-async function ensureUser(identifyAs?: string): Promise<string | null> {
-  const existing = getStoredUserId();
-  if (existing) return existing;
+function buildWidget(): void {
+  if (!state || state.widgetRoot) return;
 
-  let name = identifyAs;
-  if (!name) {
-    const fromModal = await showFirstTimeModal();
-    if (!fromModal) return null;
-    name = fromModal;
-  }
+  const root = document.createElement('div');
+  root.setAttribute('data-heatmap-widget', '');
+  root.style.cssText = `
+    position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  `;
 
-  return registerUser(name);
+  const pill = document.createElement('button');
+  pill.setAttribute('data-heatmap-pill', '');
+  pill.style.cssText = `
+    background: #1a1a1a; color: #e5e5e5; border: 1px solid #333;
+    border-radius: 999px; padding: 8px 14px; font-size: 12px; font-weight: 500;
+    cursor: pointer; display: flex; align-items: center; gap: 8px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+  `;
+  pill.innerHTML = `
+    <span style="width:8px;height:8px;border-radius:50%;background:#666;display:inline-block;"></span>
+    <span>Heatmap mode</span>
+  `;
+  pill.addEventListener('click', () => void start());
+
+  const recording = document.createElement('div');
+  recording.setAttribute('data-heatmap-recording', '');
+  recording.style.cssText = `
+    display: none; background: #1a1a1a; color: #e5e5e5; border: 1px solid #333;
+    border-radius: 999px; padding: 6px 6px 6px 14px; font-size: 12px; font-weight: 500;
+    align-items: center; gap: 10px; box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+  `;
+  recording.innerHTML = `
+    <span style="display:flex;align-items:center;gap:8px;">
+      <span data-heatmap-dot style="width:8px;height:8px;border-radius:50%;background:#ef4444;
+             display:inline-block;animation:heatmap-pulse 1.4s ease-in-out infinite;"></span>
+      <span data-heatmap-label>Recording</span>
+      <span data-heatmap-count style="color:#888;tabular-nums;">0</span>
+    </span>
+    <button data-heatmap-end style="background:#fff;color:#000;border:none;
+             border-radius:999px;padding:6px 12px;font-size:11px;font-weight:600;
+             cursor:pointer;">End</button>
+  `;
+
+  const style = document.createElement('style');
+  style.textContent = `
+    @keyframes heatmap-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+  `;
+  document.head.appendChild(style);
+
+  recording.querySelector('[data-heatmap-end]')!.addEventListener('click', () => void stop());
+
+  root.appendChild(pill);
+  root.appendChild(recording);
+  document.body.appendChild(root);
+
+  state.widgetRoot = root;
+  state.pillEl = pill;
+  state.recordingEl = recording;
 }
 
-function onClick(e: MouseEvent): void {
-  if (!state || !state.userId) return;
-  state.buffer.push({
-    x: Math.round(e.clientX),
-    y: Math.round(e.clientY),
-    page: location.pathname,
-    viewportW: window.innerWidth,
-    viewportH: window.innerHeight,
-    ts: Date.now(),
-  });
-  if (state.buffer.length >= state.options.maxBatchSize) {
-    void flush();
+function renderWidget(): void {
+  if (!state || !state.pillEl || !state.recordingEl) return;
+  if (state.tracking) {
+    state.pillEl.style.display = 'none';
+    state.recordingEl.style.display = 'flex';
+    const countEl = state.recordingEl.querySelector('[data-heatmap-count]');
+    if (countEl) countEl.textContent = String(state.buffer.length + state.batchNumber * 100);
+  } else {
+    state.pillEl.style.display = 'flex';
+    state.recordingEl.style.display = 'none';
   }
+}
+
+async function registerUser(name: string): Promise<string> {
+  if (!state) throw new Error('No state');
+  const res = await fetch(`${state.config.endpoint}/api/v1/users`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(`User registration failed: ${res.status}`);
+  const data = (await res.json()) as { userId: string; name: string };
+  return data.userId;
 }
 
 async function flush(useBeacon = false): Promise<void> {
-  if (!state || !state.userId || state.buffer.length === 0) return;
+  if (!state || !state.userId || !state.sessionId || state.buffer.length === 0) return;
   const events = state.buffer;
   state.buffer = [];
   const batchNumber = state.batchNumber++;
 
   const payload = {
-    project: state.options.project,
+    project: state.config.project,
     sessionId: state.sessionId,
     userId: state.userId,
     batchNumber,
     events,
   };
 
-  const url = `${state.options.endpoint}/api/v1/events`;
+  const url = `${state.config.endpoint}/api/v1/events`;
 
   if (useBeacon && navigator.sendBeacon) {
     const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
@@ -222,63 +281,166 @@ async function flush(useBeacon = false): Promise<void> {
   }
 }
 
-export function init(options: InitOptions): void {
-  if (state?.started) {
-    console.warn('[heatmap-tracker] already initialized');
+function onClick(e: MouseEvent): void {
+  if (!state || !state.tracking || !state.userId) return;
+  const target = e.target as HTMLElement | null;
+  if (target?.closest('[data-heatmap-widget]')) return;
+  if (target?.closest('[data-heatmap-modal]')) return;
+
+  state.buffer.push({
+    x: Math.round(e.clientX),
+    y: Math.round(e.clientY),
+    page: location.pathname,
+    viewportW: window.innerWidth,
+    viewportH: window.innerHeight,
+    ts: Date.now(),
+  });
+  renderWidget();
+  if (state.buffer.length >= state.config.maxBatchSize) {
+    void flush();
+  }
+}
+
+export async function start(): Promise<void> {
+  if (!state) {
+    console.warn('[heatmap-tracker] widget not mounted — call mountWidget() first');
+    return;
+  }
+  if (state.tracking) return;
+  if (isOptedOut()) return;
+
+  const name = await showNameModal();
+  if (!name) return;
+
+  let userId: string;
+  try {
+    userId = await registerUser(name);
+  } catch (err) {
+    console.warn('[heatmap-tracker] user registration failed', err);
     return;
   }
 
-  if (isOptedOut()) return;
+  state.userId = userId;
+  state.userName = name;
+  state.sessionId = uuid();
+  state.buffer = [];
+  state.batchNumber = 0;
+  state.tracking = true;
 
-  state = {
-    options: {
-      project: options.project,
-      endpoint: options.endpoint.replace(/\/$/, ''),
-      flushIntervalMs: options.flushIntervalMs ?? 30000,
-      maxBatchSize: options.maxBatchSize ?? 100,
-    },
-    userId: null,
-    sessionId: uuid(),
-    buffer: [],
-    batchNumber: 0,
-    flushTimer: null,
-    started: true,
-  };
+  ssSet(SS_ACTIVE, '1');
+  ssSet(SS_USER_ID, userId);
+  ssSet(SS_USER_NAME, name);
+  ssSet(SS_SESSION_ID, state.sessionId);
 
-  void (async () => {
-    const userId = await ensureUser(options.identifyAs).catch((err) => {
-      console.warn('[heatmap-tracker] user registration failed', err);
-      return null;
-    });
-    if (!userId || !state) return;
-    state.userId = userId;
+  attachListeners();
+  state.flushTimer = window.setInterval(() => void flush(), state.config.flushIntervalMs);
+  renderWidget();
+}
 
-    window.addEventListener('click', onClick, { capture: true, passive: true });
-    state.flushTimer = window.setInterval(() => void flush(), state.options.flushIntervalMs);
+export async function stop(): Promise<void> {
+  if (!state || !state.tracking) return;
+  await flush();
+  if (state.flushTimer) {
+    clearInterval(state.flushTimer);
+    state.flushTimer = null;
+  }
+  state.tracking = false;
+  state.userId = null;
+  state.userName = null;
+  state.sessionId = null;
+  state.buffer = [];
+  state.batchNumber = 0;
 
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') void flush(true);
-    });
-    window.addEventListener('pagehide', () => void flush(true));
-  })();
+  ssDel(SS_ACTIVE);
+  ssDel(SS_USER_ID);
+  ssDel(SS_USER_NAME);
+  ssDel(SS_SESSION_ID);
+
+  renderWidget();
+}
+
+export function isTracking(): boolean {
+  return state?.tracking ?? false;
 }
 
 export function optOut(): void {
   try {
     localStorage.setItem(LS_OPTOUT, 'true');
-    localStorage.removeItem(LS_USER_ID);
-    localStorage.removeItem(LS_USER_NAME);
   } catch {
     /* ignore */
   }
-  if (state?.flushTimer) clearInterval(state.flushTimer);
-  state = null;
+  void stop();
+  if (state?.widgetRoot) {
+    state.widgetRoot.remove();
+    state.widgetRoot = null;
+    state.pillEl = null;
+    state.recordingEl = null;
+  }
 }
 
-export function getUserName(): string | null {
-  try {
-    return localStorage.getItem(LS_USER_NAME);
-  } catch {
-    return null;
+function attachListeners(): void {
+  if (!clickListenerAttached) {
+    window.addEventListener('click', onClick, { capture: true, passive: true });
+    clickListenerAttached = true;
+  }
+  if (!visibilityListenerAttached) {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') void flush(true);
+    });
+    window.addEventListener('pagehide', () => void flush(true));
+    visibilityListenerAttached = true;
+  }
+}
+
+export function mountWidget(config: WidgetConfig): void {
+  if (state) {
+    console.warn('[heatmap-tracker] widget already mounted');
+    return;
+  }
+  if (isOptedOut()) return;
+
+  state = {
+    config: {
+      project: config.project,
+      endpoint: config.endpoint.replace(/\/$/, ''),
+      flushIntervalMs: config.flushIntervalMs ?? 30000,
+      maxBatchSize: config.maxBatchSize ?? 100,
+    },
+    tracking: false,
+    userId: null,
+    userName: null,
+    sessionId: null,
+    buffer: [],
+    batchNumber: 0,
+    flushTimer: null,
+    widgetRoot: null,
+    pillEl: null,
+    recordingEl: null,
+  };
+
+  const init = () => {
+    buildWidget();
+
+    const wasActive = ssGet(SS_ACTIVE) === '1';
+    const savedUserId = ssGet(SS_USER_ID);
+    const savedUserName = ssGet(SS_USER_NAME);
+    const savedSessionId = ssGet(SS_SESSION_ID);
+
+    if (wasActive && savedUserId && savedUserName && savedSessionId && state) {
+      state.userId = savedUserId;
+      state.userName = savedUserName;
+      state.sessionId = savedSessionId;
+      state.tracking = true;
+      attachListeners();
+      state.flushTimer = window.setInterval(() => void flush(), state.config.flushIntervalMs);
+    }
+
+    renderWidget();
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
   }
 }

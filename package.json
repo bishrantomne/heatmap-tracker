@@ -1,6 +1,6 @@
 {
   "name": "@bishrantomne/heatmap-tracker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lightweight click heatmap tracker for Omne projects",
   "type": "module",
   "main": "./dist/index.cjs",

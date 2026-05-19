@@ -1,17 +1,17 @@
-type InitOptions = {
+type WidgetConfig = {
     /** Project slug, must match an entry in heatmap-data/projects.json */
     project: string;
-    /** Full URL of the deployed heatmap-proxy, e.g. https://heatmap-proxy-two.vercel.app */
+    /** Full URL of the deployed heatmap-proxy */
     endpoint: string;
-    /** Flush interval in ms. Default 30000 (30s). */
+    /** Flush interval in ms. Default 30000. */
     flushIntervalMs?: number;
     /** Max events buffered before forced flush. Default 100. */
     maxBatchSize?: number;
-    /** Skip the first-time name modal — use when host app already has user context. */
-    identifyAs?: string;
 };
-declare function init(options: InitOptions): void;
+declare function start(): Promise<void>;
+declare function stop(): Promise<void>;
+declare function isTracking(): boolean;
 declare function optOut(): void;
-declare function getUserName(): string | null;
+declare function mountWidget(config: WidgetConfig): void;
 
-export { getUserName, init, optOut };
+export { isTracking, mountWidget, optOut, start, stop };
